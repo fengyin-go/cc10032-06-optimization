@@ -227,29 +227,44 @@ def create_backfill_from_late(
     target_index: str,
     source_name: str,
 ) -> dict[str, Any]:
-    """根据迟到数据自动生成补数任务。"""
+    """根据迟到数据自动生成补数任务。
+
+    序号6修复：迟到旁路数据先发布版本，再经补数服务统一入口提交，
+    重复调用（同一来源 + 同一区间）幂等，不再为同一目标生成多条作业。
+    """
     if not late_entries:
         return {"created": False, "reason": "无迟到数据需要补数"}
     min_ts = min(le.event_time for le in late_entries)
     max_ts = max(le.event_time for le in late_entries)
-    job = {
-        "id": max(
-            (int(r.get("id", 0)) for r in store.rows("backfill_job")), default=0
-        ) + 1,
-        "作业名称": f"自动补数_{source_name}_{int(min_ts)}",
-        "目标指标": target_index,
-        "补数范围": f"{int(min_ts)}-{int(max_ts)}",
-        "并行度": min(len(late_entries), 8),
-        "起始位点": str(int(min_ts)),
-        "截止位点": str(int(max_ts)),
-        "进度比例": "0%",
-        "status": "待执行",
-        "pending": True,
-        "abnormal": False,
-        "_late_count": len(late_entries),
+    lo, hi = int(min_ts), int(max_ts)
+
+    from app.services.backfill_job import BackfillJobService
+    from app.services.side_output import side_output_service
+
+    side_version = side_output_service.publish(
+        target_index,
+        [(lo, hi)],
+        source=f"pipeline:{source_name}",
+        entries=[le.original for le in late_entries],
+    )
+    service = BackfillJobService()
+    result = service.submit_backfill(
+        target_index, lo, hi,
+        trigger_source="auto",
+        request_key=f"pipeline::{source_name}::{target_index}::{lo}-{hi}",
+        job_name=f"自动补数_{source_name}_{lo}",
+    )
+    if not result.get("ok"):
+        return {"created": False, "reason": result.get("error", "补数提交失败")}
+    return {
+        "created": not result.get("idempotent", False),
+        "idempotent": bool(result.get("idempotent")),
+        "job_id": result.get("job_id"),
+        "job_name": result.get("job_name"),
+        "mode": result.get("mode"),
+        "active_ranges": result.get("active_ranges"),
+        "side_output_version": side_version["version"],
     }
-    store.rows("backfill_job").append(job)
-    return {"created": True, "job_id": job["id"], "job_name": job["作业名称"]}
 
 
 # ---- 链路3: join_stream → calc_operator → aggregate_sink → checkpoint_mgr ----

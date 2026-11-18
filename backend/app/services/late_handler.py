@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.side_output import side_output_service
 from app.store import store
 
 
@@ -99,8 +100,20 @@ class LateHandlerService(BaseModuleService):
 
     def trigger_backfill_for_late(
         self, policy_name: str, late_count: int, source_name: str,
+        *,
+        target_metric: str | None = None,
+        request_key: str | None = None,
+        mode: str = "absorb",
+        start_offset: int = 0,
+        end_offset: int | None = None,
+        entries: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """当迟到数据超过阈值时自动触发补数任务。"""
+        """当迟到数据超过阈值时自动触发补数任务。
+
+        序号6修复：先发布版本化迟到旁路数据，再通过补数服务的统一入口提交，
+        与人工补数在同一区间相遇时按 mode 收敛为一个活动范围；
+        request_key 保证同一迟到批次重复触发时幂等，不再生成多条作业。
+        """
         if late_count == 0:
             return {"ok": True, "triggered": False, "reason": "无迟到数据"}
 
@@ -111,37 +124,66 @@ class LateHandlerService(BaseModuleService):
                 mark_field = r.get("标记字段", "_late_mark")
                 break
 
-        # 创建补数任务
-        job = {
-            "id": max(
-                (int(r.get("id", 0)) for r in store.rows("backfill_job")), default=0
-            ) + 1,
-            "作业名称": f"late_backfill_{source_name}_{int(time.time())}",
-            "目标指标": f"late_data_{source_name}",
-            "补数范围": f"0-{late_count}",
-            "并行度": str(min(late_count, 8)),
-            "起始位点": "0",
-            "截止位点": str(late_count),
-            "进度比例": "0%",
-            "status": "待执行",
-            "pending": True,
-            "abnormal": False,
-            "_triggered_by": policy_name,
-            "_late_count": late_count,
-        }
-        store.rows("backfill_job").append(job)
+        metric = target_metric or f"late_data_{source_name}"
+        hi = late_count if end_offset is None else end_offset
+        # 1. 发布迟到旁路数据新版本（补数作业唯一引用的当前版本）
+        side_version = side_output_service.publish(
+            metric,
+            [(start_offset, hi)],
+            source=f"{policy_name}:{source_name}",
+            entries=entries,
+        )
 
+        # 2. 通过统一入口提交自动补数（重叠范围合并，不再直接 append 作业）
+        from app.services.backfill_job import BackfillJobService
+        backfill_service = BackfillJobService()
+        result = backfill_service.submit_backfill(
+            metric, start_offset, hi,
+            trigger_source="auto",
+            request_key=request_key or f"auto::{policy_name}::{source_name}::{start_offset}-{hi}",
+            job_name=f"late_backfill_{source_name}_{int(time.time())}",
+            mode=mode,
+        )
+
+        store.append_repair_ledger({
+            "module": "late_handler",
+            "related_modules": ["backfill_job", "side_output"],
+            "repair_seq": "序号6",
+            "action": "auto_trigger_backfill",
+            "detail": {
+                "policy": policy_name, "source": source_name,
+                "late_count": late_count,
+                "side_output_version": side_version["version"],
+                "submit_result": {
+                    k: v for k, v in result.items() if k != "merge_logs"
+                },
+            },
+        })
+
+        if not result.get("ok"):
+            return {
+                "ok": False, "triggered": False,
+                "reason": result.get("error", "自动补数提交失败"),
+                "side_output_version": side_version["version"],
+            }
         return {
             "ok": True,
             "triggered": True,
+            "idempotent": bool(result.get("idempotent")),
             "policy": policy_name,
             "late_count": late_count,
-            "backfill_job_id": job["id"],
-            "backfill_job_name": job["作业名称"],
+            "target_metric": metric,
+            "mark_field": mark_field,
+            "side_output_version": side_version["version"],
+            "side_output_key": side_version["side_output_key"],
+            "backfill_job_id": result.get("job_id"),
+            "backfill_job_name": result.get("job_name"),
+            "active_ranges": result.get("active_ranges"),
+            "mode": result.get("mode", "idempotent" if result.get("idempotent") else "create"),
         }
 
     def list_late_statistics(self) -> list[dict[str, Any]]:
-        """列出所有迟到处理策略的统计信息。"""
+        """列出所有迟到处理策略的统计信息（含旁路版本与联动补数）。"""
         result = []
         for r in store.rows(self.MODULE):
             if r.get("id", 0) < 100:
@@ -149,13 +191,28 @@ class LateHandlerService(BaseModuleService):
                 linked_jobs = sum(
                     1 for b in store.rows("backfill_job")
                     if name in str(b.get("_triggered_by", ""))
+                    or any(
+                        name in str(sv.get("side_output_key", ""))
+                        for sv in b.get("_source_versions", [])
+                    )
                 )
+                # 汇总该策略相关的当前旁路版本
+                side_versions = [
+                    {
+                        "target_metric": ver["target_metric"],
+                        "version": ver["version"],
+                        "ranges": ver["ranges"],
+                    }
+                    for ver in store.list_side_outputs()
+                    if name in str(ver.get("source", ""))
+                ]
                 result.append({
                     "policy": name,
                     "action": r.get("迟到动作", ""),
                     "threshold": r.get("阈值百分比", ""),
                     "status": r.get("status", ""),
                     "linked_backfills": linked_jobs,
+                    "side_output_versions": side_versions,
                 })
         return result
 

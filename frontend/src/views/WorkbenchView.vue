@@ -43,6 +43,7 @@
           <th v-for="column in meta.fields" :key="column">{{ column }}</th>
           <th>当前状态</th>
           <th>可执行动作</th>
+          <th v-if="isBackfill">序号6复核</th>
         </tr>
       </thead>
       <tbody>
@@ -61,14 +62,26 @@
               {{ action }}
             </button>
           </td>
+          <td v-if="isBackfill" class="row-actions">
+            <button
+              class="link"
+              type="button"
+              :data-testid="`detail-${row.id}`"
+              @click="openBackfillDetail(Number(row.id))"
+            >
+              详情面板
+            </button>
+          </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="meta.fields.length + 2" class="empty-state">
+          <td :colspan="meta.fields.length + (isBackfill ? 3 : 2)" class="empty-state">
             暂无{{ meta.name }}数据，可先登记{{ meta.entity }}
           </td>
         </tr>
       </tbody>
     </table>
+
+    <BackfillWorkbench v-if="isBackfill" ref="workbenchRef" @changed="reload" />
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -103,10 +116,13 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import BackfillWorkbench from '@/views/BackfillWorkbench.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const isBackfill = computed(() => props.moduleKey === 'backfill_job')
+const workbenchRef = ref<InstanceType<typeof BackfillWorkbench> | null>(null)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -187,5 +203,14 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+function openBackfillDetail(jobId: number) {
+  void workbenchRef.value?.openDetail(jobId)
+}
+
+onMounted(() => {
+  void reload()
+  if (isBackfill.value) {
+    void workbenchRef.value?.loadReview()
+  }
+})
 </script>
